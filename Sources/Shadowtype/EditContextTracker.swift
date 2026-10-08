@@ -32,10 +32,19 @@ final class EditContextTracker {
     private var observedElement: AXUIElement?
 
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var quitObserver: NSObjectProtocol?
+    private var defaultsObserver: NSObjectProtocol?
+    private var chromiumFallbackWasOn = false
     private var started = false
 
-    // Forces lazy Electron/Chromium AX trees to materialize (once per app) so text-marker reads work
-    // in VS Code/Cursor/Windsurf/Slack/Arc/Dia without VoiceOver. Harmless on native apps.
+    // Whether Shadowtype is on for the app with this bundle id (the global pause and the per-app rules).
+    // Set by AppDelegate. The Chromium accessibility fallback leaves an app alone when this says no.
+    var isAppEnabled: (String?) -> Bool = { _ in true }
+
+    // Forces lazy Electron/Chromium AX trees to materialize so text-marker reads work in
+    // VS Code/Cursor/Windsurf/Slack/Arc/Dia without VoiceOver (AXManualAccessibility, once per app).
+    // Harmless on native apps. Also owns the opt-in AXEnhancedUserInterface fallback for Chromium apps
+    // that ignore that attribute, which is switched on per activation and off again after the app leaves.
     private let electronA11y = ElectronAccessibility()
     // The pid we've already nil-prefix-rewaked during the current focus session. Cleared on
     // refreshFocus so a fresh focus (or app switch) is eligible again. Prevents `rewakeBrowserAXIfPossible`
@@ -106,6 +115,42 @@ final class EditContextTracker {
             self?.refreshFocus()
         }
         workspaceObservers.append(activated)
+        // The Chromium accessibility fallback is only on while the app is in front: it is switched off a
+        // few seconds after the app deactivates, and every app is switched off when Shadowtype quits.
+        let deactivated = wc.addObserver(forName: NSWorkspace.didDeactivateApplicationNotification,
+                                         object: nil, queue: .main) { [weak self] note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                self?.electronA11y.applicationDidDeactivate(pid: app.processIdentifier)
+            }
+        }
+        workspaceObservers.append(deactivated)
+        // Pids are reused: forget what we learned about an app when it quits.
+        let terminated = wc.addObserver(forName: NSWorkspace.didTerminateApplicationNotification,
+                                        object: nil, queue: .main) { [weak self] note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                self?.electronA11y.applicationDidTerminate(pid: app.processIdentifier)
+            }
+        }
+        workspaceObservers.append(terminated)
+        quitObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.electronA11y.revertAll()
+        }
+        // Not while Shadowtype is paused or the app is disabled in App rules.
+        electronA11y.isAllowed = { [weak self] pid in
+            guard let self else { return false }
+            return self.isAppEnabled(NSRunningApplication(processIdentifier: pid)?.bundleIdentifier)
+        }
+        // Turning the opt-in off switches every app off at once instead of when it next loses focus.
+        chromiumFallbackWasOn = ElectronAccessibility.liveEnhancedEnabled()
+        defaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            let isOn = ElectronAccessibility.liveEnhancedEnabled()
+            guard isOn != self.chromiumFallbackWasOn else { return }
+            self.chromiumFallbackWasOn = isOn
+            self.electronA11y.enhancedSettingDidChange()
+        }
 
         refreshFocus()
     }
@@ -116,6 +161,9 @@ final class EditContextTracker {
         let wc = NSWorkspace.shared.notificationCenter
         for o in workspaceObservers { wc.removeObserver(o) }
         workspaceObservers.removeAll()
+        if let q = quitObserver { NotificationCenter.default.removeObserver(q); quitObserver = nil }
+        if let d = defaultsObserver { NotificationCenter.default.removeObserver(d); defaultsObserver = nil }
+        electronA11y.revertAll()
         teardownObserver()
         focused = nil
     }
@@ -1083,12 +1131,21 @@ final class EditContextTracker {
 
     // MARK: - Focus + AXObserver
 
-    private func refreshFocus() {
+    // How long after switching a Chromium app's accessibility flag on we read its focus again: the host
+    // is still building its tree when the first read happens.
+    private static let focusRetryDelay: TimeInterval = 0.4
+
+    private func refreshFocus(isRetry: Bool = false) {
         let front = NSWorkspace.shared.frontmostApplication
         frontmostBundleId = front?.bundleIdentifier
-        // Nudge Electron/Chromium to expose its AX tree before we read it (once per app). The write is
-        // unsupported (no-op) on native apps, so this is safe to attempt for every frontmost app.
-        if let pid = front?.processIdentifier { electronA11y.forceIfNeeded(pid: pid) }
+        // Nudge Electron/Chromium to expose its AX tree before we read it (AXManualAccessibility once per
+        // app; the opt-in fallback flag on every activation). The write is unsupported (no-op) on native
+        // apps, so this is safe to attempt for every frontmost app.
+        var flagJustWritten = false
+        if let pid = front?.processIdentifier { flagJustWritten = electronA11y.applicationDidActivate(pid: pid) }
+        defer {
+            if flagJustWritten, let pid = front?.processIdentifier { scheduleFocusRetry(pid: pid) }
+        }
         // Re-arm the per-focus-session browser-AX rewake (a stale pid from a prior focus must not
         // block re-priming when the user lands on a fresh Gmail tab in the same browser process).
         rewakedPidThisFocus = nil
@@ -1105,10 +1162,24 @@ final class EditContextTracker {
             }
             return
         }
-        if focused == nil || !cfEqual(focused!, element) { focusChangeSequence &+= 1 }
+        let sameAsBefore = focused.map { cfEqual($0, element) } ?? false
+        if !sameAsBefore { focusChangeSequence &+= 1 }
         focused = element
         attachObserver(to: element)
+        // A retry that finds the same field changes nothing for anyone downstream: no second callback.
+        if isRetry && sameAsBefore { return }
         onFocusChange?()
+    }
+
+    // Look at the focus again shortly after the fallback flag went on, and attach the observer then if the
+    // first read failed (on an error refreshFocus returns before attachObserver). Only while the same app
+    // is still in front.
+    private func scheduleFocusRetry(pid: pid_t) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.focusRetryDelay) { [weak self] in
+            guard let self, self.started,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            self.refreshFocus(isRetry: true)
+        }
     }
 
     // Frame (Cocoa bottom-left coords) of the focused editable field, for anchoring the active-field

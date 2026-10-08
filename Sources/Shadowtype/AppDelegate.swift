@@ -325,6 +325,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.refreshBadge()
             self.warmFocusIfFocusChanged()
         }
+        // The opt-in Chromium accessibility fallback leaves an app alone while Shadowtype is paused or the
+        // app is disabled in App rules.
+        contextTracker.isAppEnabled = { [weak self] bundle in
+            guard let self else { return false }
+            return self.enabled && self.appRules.isEnabled(bundleId: bundle, domain: nil)
+        }
         // Global force-activate hotkey (⌃`): same effect as the menu's "Force suggestions here".
         forceHotKey.onPress = { [weak self] in
             guard let self, self.permissionLifecycle?.isRunning == true else { return }
